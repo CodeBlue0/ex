@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import random
+from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import torch
 import torch.nn as nn
@@ -65,9 +67,8 @@ class GatedDNN(nn.Module):
     def forward_with_spaces(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = x.view(x.size(0), -1)
         g = torch.softmax(self.gate_net(x), dim=1)
-        # requested form: dot product between input and gate per sample
-        s = torch.sum(x * g, dim=1, keepdim=True)
-        z = x * s
+        # Pixelwise gating: each input dimension is scaled by its own gate weight.
+        z = x * g
         logits = self.backbone(z)
         return logits, g, z
 
@@ -225,17 +226,17 @@ def save_key_space_tsne(
         key_mode = "anchor_threshold"
 
     key_space = z_space[:, key_idx]
-    d = np.linalg.norm(g_space - anchor_g[None, :], axis=1)
-    sim_mask = d <= sim_threshold
+    c = cosine_similarity_to_anchor(g_space, anchor_idx)
+    sim_mask = c >= sim_threshold
     save_space_tsne_with_sim(
         space=key_space,
         sim_mask=sim_mask,
         anchor_idx=anchor_idx,
-        pred_label=pred_label,
+        label=pred_label,
         out_path=out_path,
         title=(
             f"key-space t-SNE (anchor g >= {weight_threshold:.4f}, "
-            f"SIM@{sim_threshold:.4f})"
+            f"SIM cos>={sim_threshold:.4f})"
         ),
     )
 
@@ -250,7 +251,7 @@ def save_space_tsne_with_sim(
     space: np.ndarray,
     sim_mask: np.ndarray,
     anchor_idx: int,
-    pred_label: np.ndarray,
+    label: np.ndarray,
     out_path: str,
     title: str,
 ) -> None:
@@ -260,8 +261,8 @@ def save_space_tsne_with_sim(
     plt.figure(figsize=(8, 6))
     non = ~sim_mask
     cmap = np.array(["#1f77b4", "#d62728"])
-    plt.scatter(emb[non, 0], emb[non, 1], c=cmap[pred_label[non]], s=7, alpha=0.10, label="non-SIM")
-    plt.scatter(emb[sim_mask, 0], emb[sim_mask, 1], c=cmap[pred_label[sim_mask]], s=11, alpha=0.90, label="SIM")
+    plt.scatter(emb[non, 0], emb[non, 1], c=cmap[label[non]], s=7, alpha=0.10, label="non-SIM")
+    plt.scatter(emb[sim_mask, 0], emb[sim_mask, 1], c=cmap[label[sim_mask]], s=11, alpha=0.90, label="SIM")
     plt.scatter(emb[anchor_idx, 0], emb[anchor_idx, 1], c="#facc15", s=110, marker="*", label="anchor")
     plt.title(title)
     plt.xlabel("t-SNE 1")
@@ -273,39 +274,344 @@ def save_space_tsne_with_sim(
     print(f"saved_tsne={out_path}")
 
 
+def save_space_tsne_with_sim_digit10(
+    space: np.ndarray,
+    sim_mask: np.ndarray,
+    anchor_idx: int,
+    digit_label: np.ndarray,
+    out_path: str,
+    title: str,
+) -> None:
+    tsne = TSNE(n_components=2, random_state=42, init="pca", learning_rate="auto", perplexity=30)
+    emb = tsne.fit_transform(space)
+
+    plt.figure(figsize=(8, 6))
+    non = ~sim_mask
+    cmap = plt.get_cmap("tab10")
+    c_non = cmap(np.mod(digit_label[non], 10))
+    c_sim = cmap(np.mod(digit_label[sim_mask], 10))
+    plt.scatter(emb[non, 0], emb[non, 1], c=c_non, s=7, alpha=0.10)
+    plt.scatter(emb[sim_mask, 0], emb[sim_mask, 1], c=c_sim, s=11, alpha=0.90)
+    plt.scatter(emb[anchor_idx, 0], emb[anchor_idx, 1], c="#facc15", s=110, marker="*")
+    plt.title(title)
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+
+    status_handles = [
+        Line2D([], [], marker="o", linestyle="", color="#666666", alpha=0.2, markersize=6, label="non-SIM"),
+        Line2D([], [], marker="o", linestyle="", color="#111111", alpha=0.9, markersize=6, label="SIM"),
+        Line2D([], [], marker="*", linestyle="", color="#facc15", markersize=12, label="anchor"),
+    ]
+    leg1 = plt.legend(handles=status_handles, loc="upper right", title="Group")
+    plt.gca().add_artist(leg1)
+
+    digit_handles = [
+        Line2D([], [], marker="o", linestyle="", color=cmap(i), markersize=6, label=str(i))
+        for i in range(10)
+    ]
+    plt.legend(handles=digit_handles, loc="lower right", title="Digit", ncol=2, fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    print(f"saved_tsne={out_path}")
+
+
 def save_gz_tsne_with_gspace_sim(
     g_space: np.ndarray,
     z_space: np.ndarray,
     pred_label: np.ndarray,
+    digit_label: np.ndarray,
     anchor_idx: int,
     g_out: str,
     z_out: str,
+    g_out_digit10: str,
+    z_out_digit10: str,
     threshold: float,
 ) -> None:
-    anchor_g = g_space[anchor_idx]
-    d = np.linalg.norm(g_space - anchor_g[None, :], axis=1)
-    sim_mask = d <= threshold
+    c = cosine_similarity_to_anchor(g_space, anchor_idx)
+    sim_mask = c >= threshold
 
     print(f"sim_anchor_idx={anchor_idx}")
-    print(f"sim_threshold={threshold:.6f}")
+    print(f"sim_cos_threshold={threshold:.6f}")
     print(f"sim_count={int(sim_mask.sum())}")
     print(f"sim_ratio={float(sim_mask.mean()):.6f}")
     save_space_tsne_with_sim(
         space=g_space,
         sim_mask=sim_mask,
         anchor_idx=anchor_idx,
-        pred_label=pred_label,
+        label=pred_label,
         out_path=g_out,
-        title=f"g-space t-SNE (SIM from g-space, threshold={threshold:.4f})",
+        title=f"g-space t-SNE (SIM from g-space cosine, cos>={threshold:.4f})",
     )
     save_space_tsne_with_sim(
         space=z_space,
         sim_mask=sim_mask,
         anchor_idx=anchor_idx,
-        pred_label=pred_label,
+        label=pred_label,
         out_path=z_out,
-        title=f"z-space t-SNE (SIM from g-space, threshold={threshold:.4f})",
+        title=f"z-space t-SNE (SIM from g-space cosine, cos>={threshold:.4f})",
     )
+    save_space_tsne_with_sim_digit10(
+        space=g_space,
+        sim_mask=sim_mask,
+        anchor_idx=anchor_idx,
+        digit_label=digit_label,
+        out_path=g_out_digit10,
+        title=f"g-space t-SNE (SIM from g-space cosine, true digit 0-9, cos>={threshold:.4f})",
+    )
+    save_space_tsne_with_sim_digit10(
+        space=z_space,
+        sim_mask=sim_mask,
+        anchor_idx=anchor_idx,
+        digit_label=digit_label,
+        out_path=z_out_digit10,
+        title=f"z-space t-SNE (SIM from g-space cosine, true digit 0-9, cos>={threshold:.4f})",
+    )
+
+
+def save_z_space_sim_only_tsne_digit10(
+    z_space: np.ndarray,
+    sim_mask: np.ndarray,
+    digit_label: np.ndarray,
+    anchor_idx: int,
+    out_path: str,
+) -> None:
+    sim_idx = np.where(sim_mask)[0]
+    if sim_idx.size < 2:
+        print("sim_only_tsne_warning=too_few_sim_samples")
+        return
+
+    z_sim = z_space[sim_idx]
+    d_sim = digit_label[sim_idx]
+    perplexity = float(max(5, min(30, (sim_idx.size - 1) // 3)))
+    tsne = TSNE(n_components=2, random_state=42, init="pca", learning_rate="auto", perplexity=perplexity)
+    emb = tsne.fit_transform(z_sim)
+
+    cmap = plt.get_cmap("tab10")
+    c_sim = cmap(np.mod(d_sim, 10))
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(emb[:, 0], emb[:, 1], c=c_sim, s=12, alpha=0.90)
+    anchor_pos = np.where(sim_idx == anchor_idx)[0]
+    if anchor_pos.size > 0:
+        a = int(anchor_pos[0])
+        plt.scatter(emb[a, 0], emb[a, 1], c="#facc15", s=130, marker="*")
+
+    digit_handles = [
+        Line2D([], [], marker="o", linestyle="", color=cmap(i), markersize=6, label=str(i))
+        for i in range(10)
+    ]
+    anchor_handle = [Line2D([], [], marker="*", linestyle="", color="#facc15", markersize=12, label="anchor")]
+    leg1 = plt.legend(handles=anchor_handle, loc="upper right", title="Group")
+    plt.gca().add_artist(leg1)
+    plt.legend(handles=digit_handles, loc="lower right", title="Digit", ncol=2, fontsize=8)
+
+    plt.title("z-space t-SNE (SIM-only, true digit 0-9)")
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    print(f"saved_tsne={out_path}")
+
+
+def save_z_space_sim_only_cosine_anchor_map_digit10(
+    z_space: np.ndarray,
+    g_space: np.ndarray,
+    sim_mask: np.ndarray,
+    digit_label: np.ndarray,
+    anchor_idx: int,
+    out_path: str,
+) -> None:
+    sim_idx = np.where(sim_mask)[0]
+    if sim_idx.size < 2:
+        print("sim_only_cos_map_warning=too_few_sim_samples")
+        return
+
+    z_sim = z_space[sim_idx]
+    g_sim = g_space[sim_idx]
+    d_sim = digit_label[sim_idx]
+    anchor_pos = np.where(sim_idx == anchor_idx)[0]
+    if anchor_pos.size == 0:
+        print("sim_only_cos_map_warning=anchor_not_in_sim")
+        return
+    a = int(anchor_pos[0])
+
+    g_norm = l2_normalize_rows(g_sim)
+    cos_to_anchor = g_norm @ g_norm[a]
+    radius = 1.0 - cos_to_anchor
+
+    z_center = z_sim - z_sim.mean(axis=0, keepdims=True)
+    if z_center.shape[0] >= 2:
+        u, s, vt = np.linalg.svd(z_center, full_matrices=False)
+        proj = z_center @ vt[:2].T
+        theta = np.arctan2(proj[:, 1], proj[:, 0])
+    else:
+        theta = np.zeros(z_center.shape[0], dtype=np.float64)
+
+    emb = np.column_stack([radius * np.cos(theta), radius * np.sin(theta)])
+    emb = emb - emb[a][None, :]
+
+    cmap = plt.get_cmap("tab10")
+    c_sim = cmap(np.mod(d_sim, 10))
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(emb[:, 0], emb[:, 1], c=c_sim, s=12, alpha=0.90)
+    plt.scatter(emb[a, 0], emb[a, 1], c="#facc15", s=130, marker="*")
+
+    digit_handles = [
+        Line2D([], [], marker="o", linestyle="", color=cmap(i), markersize=6, label=str(i))
+        for i in range(10)
+    ]
+    anchor_handle = [Line2D([], [], marker="*", linestyle="", color="#facc15", markersize=12, label="anchor")]
+    leg1 = plt.legend(handles=anchor_handle, loc="upper right", title="Group")
+    plt.gca().add_artist(leg1)
+    plt.legend(handles=digit_handles, loc="lower right", title="Digit", ncol=2, fontsize=8)
+
+    plt.title("z-space (SIM-only, anchor-centered by cosine similarity)")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    print(f"saved_tsne={out_path}")
+
+
+def save_z_space_sim_only_l1_anchor_map_digit10(
+    z_space: np.ndarray,
+    sim_mask: np.ndarray,
+    digit_label: np.ndarray,
+    anchor_idx: int,
+    out_path: str,
+) -> None:
+    sim_idx = np.where(sim_mask)[0]
+    if sim_idx.size < 2:
+        print("sim_only_l1_map_warning=too_few_sim_samples")
+        return
+
+    z_sim = z_space[sim_idx]
+    d_sim = digit_label[sim_idx]
+    anchor_pos = np.where(sim_idx == anchor_idx)[0]
+    if anchor_pos.size == 0:
+        print("sim_only_l1_map_warning=anchor_not_in_sim")
+        return
+    a = int(anchor_pos[0])
+
+    dist = np.sum(np.abs(z_sim - z_sim[a][None, :]), axis=1)
+    if float(dist.max()) > 0.0:
+        radius = dist / float(dist.max())
+    else:
+        radius = dist
+
+    z_center = z_sim - z_sim.mean(axis=0, keepdims=True)
+    if z_center.shape[0] >= 2:
+        _, _, vt = np.linalg.svd(z_center, full_matrices=False)
+        proj = z_center @ vt[:2].T
+        theta = np.arctan2(proj[:, 1], proj[:, 0])
+    else:
+        theta = np.zeros(z_center.shape[0], dtype=np.float64)
+
+    emb = np.column_stack([radius * np.cos(theta), radius * np.sin(theta)])
+    emb = emb - emb[a][None, :]
+
+    cmap = plt.get_cmap("tab10")
+    c_sim = cmap(np.mod(d_sim, 10))
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(emb[:, 0], emb[:, 1], c=c_sim, s=12, alpha=0.90)
+    plt.scatter(emb[a, 0], emb[a, 1], c="#facc15", s=130, marker="*")
+
+    digit_handles = [
+        Line2D([], [], marker="o", linestyle="", color=cmap(i), markersize=6, label=str(i))
+        for i in range(10)
+    ]
+    anchor_handle = [Line2D([], [], marker="*", linestyle="", color="#facc15", markersize=12, label="anchor")]
+    leg1 = plt.legend(handles=anchor_handle, loc="upper right", title="Group")
+    plt.gca().add_artist(leg1)
+    plt.legend(handles=digit_handles, loc="lower right", title="Digit", ncol=2, fontsize=8)
+
+    plt.title("z-space (SIM-only, anchor-centered by L1 distance)")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    print(f"saved_tsne={out_path}")
+
+
+def save_z_space_sim_only_l2_anchor_map_digit10(
+    z_space: np.ndarray,
+    sim_mask: np.ndarray,
+    digit_label: np.ndarray,
+    anchor_idx: int,
+    out_path: str,
+) -> None:
+    sim_idx = np.where(sim_mask)[0]
+    if sim_idx.size < 2:
+        print("sim_only_l2_map_warning=too_few_sim_samples")
+        return
+
+    z_sim = z_space[sim_idx]
+    d_sim = digit_label[sim_idx]
+    anchor_pos = np.where(sim_idx == anchor_idx)[0]
+    if anchor_pos.size == 0:
+        print("sim_only_l2_map_warning=anchor_not_in_sim")
+        return
+    a = int(anchor_pos[0])
+
+    dist = np.linalg.norm(z_sim - z_sim[a][None, :], axis=1)
+    if float(dist.max()) > 0.0:
+        radius = dist / float(dist.max())
+    else:
+        radius = dist
+
+    z_center = z_sim - z_sim.mean(axis=0, keepdims=True)
+    if z_center.shape[0] >= 2:
+        _, _, vt = np.linalg.svd(z_center, full_matrices=False)
+        proj = z_center @ vt[:2].T
+        theta = np.arctan2(proj[:, 1], proj[:, 0])
+    else:
+        theta = np.zeros(z_center.shape[0], dtype=np.float64)
+
+    emb = np.column_stack([radius * np.cos(theta), radius * np.sin(theta)])
+    emb = emb - emb[a][None, :]
+
+    cmap = plt.get_cmap("tab10")
+    c_sim = cmap(np.mod(d_sim, 10))
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(emb[:, 0], emb[:, 1], c=c_sim, s=12, alpha=0.90)
+    plt.scatter(emb[a, 0], emb[a, 1], c="#facc15", s=130, marker="*")
+
+    digit_handles = [
+        Line2D([], [], marker="o", linestyle="", color=cmap(i), markersize=6, label=str(i))
+        for i in range(10)
+    ]
+    anchor_handle = [Line2D([], [], marker="*", linestyle="", color="#facc15", markersize=12, label="anchor")]
+    leg1 = plt.legend(handles=anchor_handle, loc="upper right", title="Group")
+    plt.gca().add_artist(leg1)
+    plt.legend(handles=digit_handles, loc="lower right", title="Digit", ncol=2, fontsize=8)
+
+    plt.title("z-space (SIM-only, anchor-centered by L2 distance)")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    print(f"saved_tsne={out_path}")
+
+
+def cosine_similarity_to_anchor(space: np.ndarray, anchor_idx: int) -> np.ndarray:
+    normed = l2_normalize_rows(space)
+    anchor = normed[anchor_idx]
+    return normed @ anchor
+
+
+def l2_normalize_rows(space: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(space, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    return space / norms
 
 
 @torch.no_grad()
@@ -314,19 +620,21 @@ def collect_gz_from_loader(
     loader: DataLoader,
     device: torch.device,
     max_samples: int = 3000,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
     g_list: list[np.ndarray] = []
     z_list: list[np.ndarray] = []
     pred_list: list[np.ndarray] = []
+    digit_list: list[np.ndarray] = []
     collected = 0
 
-    for xb, _ in loader:
+    for xb, y_digit in loader:
         xb = xb.to(device)
         logits, g, z = model.forward_with_spaces(xb)
         g_np = g.detach().cpu().numpy()
         z_np = z.detach().cpu().numpy()
         p_np = logits.argmax(dim=1).detach().cpu().numpy()
+        d_np = y_digit.detach().cpu().numpy()
 
         if collected + g_np.shape[0] > max_samples:
             keep = max_samples - collected
@@ -335,15 +643,22 @@ def collect_gz_from_loader(
             g_np = g_np[:keep]
             z_np = z_np[:keep]
             p_np = p_np[:keep]
+            d_np = d_np[:keep]
 
         g_list.append(g_np)
         z_list.append(z_np)
         pred_list.append(p_np)
+        digit_list.append(d_np)
         collected += g_np.shape[0]
         if collected >= max_samples:
             break
 
-    return np.concatenate(g_list, axis=0), np.concatenate(z_list, axis=0), np.concatenate(pred_list, axis=0)
+    return (
+        np.concatenate(g_list, axis=0),
+        np.concatenate(z_list, axis=0),
+        np.concatenate(pred_list, axis=0),
+        np.concatenate(digit_list, axis=0),
+    )
 
 
 def main(args: argparse.Namespace) -> None:
@@ -367,12 +682,6 @@ def main(args: argparse.Namespace) -> None:
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-    print("[baseline]")
-    base = BaselineDNN(hidden_dims=(args.h1, args.h2, args.h3), n_classes=2)
-    m_base = train_and_eval(base, train_loader, val_loader, test_loader, device, args.epochs, args.lr)
-    print(f"baseline_best_val_acc={m_base['best_val_acc']:.6f}")
-    print(f"baseline_test_acc={m_base['test_acc']:.6f}")
-
     print("[gated]")
     gate = GatedDNN(hidden_dims=(args.h1, args.h2, args.h3), gate_hidden=args.gate_hidden, n_classes=2)
     m_gate = train_and_eval(gate, train_loader, val_loader, test_loader, device, args.epochs, args.lr)
@@ -386,23 +695,59 @@ def main(args: argparse.Namespace) -> None:
         z_out=args.z_tsne_out,
         max_samples=args.tsne_samples,
     )
-    g_space, z_space, pred_label = collect_gz_from_loader(
+    g_space, z_space, pred_label, true_digit = collect_gz_from_loader(
         m_gate["model"],
         test_loader,
         device,
         max_samples=args.tsne_samples,
     )
-    rng = np.random.default_rng(args.seed)
-    anchor_idx = int(rng.integers(0, g_space.shape[0]))
+    if 0 <= args.anchor_idx < g_space.shape[0]:
+        anchor_idx = int(args.anchor_idx)
+    else:
+        rng = np.random.default_rng(args.seed)
+        anchor_idx = int(rng.integers(0, g_space.shape[0]))
 
     save_gz_tsne_with_gspace_sim(
         g_space=g_space,
         z_space=z_space,
         pred_label=pred_label,
+        digit_label=true_digit,
         anchor_idx=anchor_idx,
         g_out=args.g_sim_tsne_out,
         z_out=args.z_sim_tsne_out,
+        g_out_digit10=args.g_sim_tsne_out_digit10,
+        z_out_digit10=args.z_sim_tsne_out_digit10,
         threshold=args.sim_threshold,
+    )
+    sim_mask = cosine_similarity_to_anchor(g_space, anchor_idx) >= args.sim_threshold
+    save_z_space_sim_only_tsne_digit10(
+        z_space=z_space,
+        sim_mask=sim_mask,
+        digit_label=true_digit,
+        anchor_idx=anchor_idx,
+        out_path=args.z_sim_only_tsne_out_digit10,
+    )
+    save_z_space_sim_only_cosine_anchor_map_digit10(
+        z_space=z_space,
+        g_space=g_space,
+        sim_mask=sim_mask,
+        digit_label=true_digit,
+        anchor_idx=anchor_idx,
+        out_path=args.z_sim_only_cosmap_out_digit10,
+    )
+    save_z_space_sim_only_l1_anchor_map_digit10(
+        z_space=z_space,
+        sim_mask=sim_mask,
+        digit_label=true_digit,
+        anchor_idx=anchor_idx,
+        out_path=args.z_sim_only_l1map_out_digit10,
+    )
+    save_z_space_sim_only_l2_anchor_map_digit10(
+        z_space=z_space,
+        sim_mask=sim_mask,
+        digit_label=true_digit,
+        anchor_idx=anchor_idx,
+        out_path=args.z_sim_only_l2map_out_digit10,
     )
     save_key_space_tsne(
         g_space=g_space,
@@ -415,12 +760,15 @@ def main(args: argparse.Namespace) -> None:
         key_dims=parse_key_dims(args.key_dims),
     )
 
-    print("[delta gated - baseline]")
-    print(f"delta_val_acc={m_gate['best_val_acc'] - m_base['best_val_acc']:.6f}")
-    print(f"delta_test_acc={m_gate['test_acc'] - m_base['test_acc']:.6f}")
+    print("[baseline] skipped in exp1")
 
 
 if __name__ == "__main__":
+    script_dir = Path(__file__).resolve().parent
+
+    def default_out(name: str) -> str:
+        return str(script_dir / f"{name}.png")
+
     def parse_key_dims(text: str) -> list[int] | None:
         t = text.strip()
         if not t:
@@ -443,14 +791,37 @@ if __name__ == "__main__":
     parser.add_argument("--h2", type=int, default=256)
     parser.add_argument("--h3", type=int, default=128)
     parser.add_argument("--gate-hidden", type=int, default=256)
-    parser.add_argument("--g-tsne-out", type=str, default="/workspace/mnist_g_space_tsne_pred01.png")
-    parser.add_argument("--z-tsne-out", type=str, default="/workspace/mnist_z_space_tsne_pred01.png")
-    parser.add_argument("--g-sim-tsne-out", type=str, default="/workspace/mnist_g_space_tsne_sim_from_g.png")
-    parser.add_argument("--z-sim-tsne-out", type=str, default="/workspace/mnist_z_space_tsne_sim_from_g.png")
-    parser.add_argument("--key-space-tsne-out", type=str, default="/workspace/mnist_key_space_tsne_pred01.png")
+    parser.add_argument("--g-tsne-out", type=str, default=default_out("mnist_g_space_tsne_pred01"))
+    parser.add_argument("--z-tsne-out", type=str, default=default_out("mnist_z_space_tsne_pred01"))
+    parser.add_argument("--g-sim-tsne-out", type=str, default=default_out("mnist_g_space_tsne_sim_from_g"))
+    parser.add_argument("--z-sim-tsne-out", type=str, default=default_out("mnist_z_space_tsne_sim_from_g"))
+    parser.add_argument("--g-sim-tsne-out-digit10", type=str, default=default_out("mnist_g_space_tsne_sim_from_g_digit10"))
+    parser.add_argument("--z-sim-tsne-out-digit10", type=str, default=default_out("mnist_z_space_tsne_sim_from_g_digit10"))
+    parser.add_argument("--z-sim-only-tsne-out-digit10", type=str, default=default_out("mnist_z_space_tsne_sim_only_digit10"))
+    parser.add_argument("--z-sim-only-cosmap-out-digit10", type=str, default=default_out("mnist_z_space_cosine_anchor_sim_only_digit10"))
+    parser.add_argument("--z-sim-only-l1map-out-digit10", type=str, default=default_out("mnist_z_space_l1_anchor_sim_only_digit10"))
+    parser.add_argument("--z-sim-only-l2map-out-digit10", type=str, default=default_out("mnist_z_space_l2_anchor_sim_only_digit10"))
+    parser.add_argument("--key-space-tsne-out", type=str, default=default_out("mnist_key_space_tsne_pred01"))
     parser.add_argument("--key-dims", type=str, default="")
     parser.add_argument("--tsne-samples", type=int, default=3000)
-    parser.add_argument("--sim-threshold", type=float, default=0.03)
+    parser.add_argument("--anchor-idx", type=int, default=892)
+    parser.add_argument("--sim-threshold", type=float, default=0.85)
     parser.add_argument("--key-weight-threshold", type=float, default=0.01)
     args = parser.parse_args()
+
+    for path in (
+        args.g_tsne_out,
+        args.z_tsne_out,
+        args.g_sim_tsne_out,
+        args.z_sim_tsne_out,
+        args.g_sim_tsne_out_digit10,
+        args.z_sim_tsne_out_digit10,
+        args.z_sim_only_tsne_out_digit10,
+        args.z_sim_only_cosmap_out_digit10,
+        args.z_sim_only_l1map_out_digit10,
+        args.z_sim_only_l2map_out_digit10,
+        args.key_space_tsne_out,
+    ):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+
     main(args)

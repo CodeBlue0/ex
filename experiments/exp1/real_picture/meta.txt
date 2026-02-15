@@ -1,0 +1,8 @@
+device=cuda
+anchor_idx=892
+anchor_digit=2
+sim_threshold_requested=0.9
+sim_threshold_effective=0.86
+sim_count=56
+same_top5=278,764,1824,1485,905
+diff_top5=567,2748,2656,1619,1843

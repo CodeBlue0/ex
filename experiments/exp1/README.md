@@ -23,3 +23,7 @@
 - sim_anchor_idx: 267
 - sim_ratio (@0.20): 0.072333
 - fixed key dims: [542, 157]
+
+
+
+너무 노이즈가 많고 같은 label만 선택됨

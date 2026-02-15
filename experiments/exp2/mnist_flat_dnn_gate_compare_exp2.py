@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import random
+from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import torch
 import torch.nn as nn
@@ -65,9 +67,8 @@ class GatedDNN(nn.Module):
     def forward_with_spaces(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = x.view(x.size(0), -1)
         g = torch.softmax(self.gate_net(x), dim=1)
-        # requested form: dot product between input and gate per sample
-        s = torch.sum(x * g, dim=1, keepdim=True)
-        z = x * s
+        # Pixelwise gating: each input dimension is scaled by its own gate weight.
+        z = x * g
         logits = self.backbone(z)
         return logits, g, z
 
@@ -155,17 +156,17 @@ def save_space_tsne_by_pred(space: np.ndarray, pred_label: np.ndarray, out_path:
 
 
 def save_key_space_tsne(
-    g_space: np.ndarray,
     g_space_for_sim: np.ndarray,
     z_space: np.ndarray,
     pred_label: np.ndarray,
     anchor_idx: int,
-    weight_threshold: float,
-    sim_threshold: float,
+    key_topk: int,
+    sim_cos_threshold: float,
+    min_sim_count: int,
     out_path: str,
     key_dims: list[int] | None = None,
 ) -> None:
-    anchor_g = g_space[anchor_idx]
+    anchor_g = g_space_for_sim[anchor_idx]
     if key_dims is not None and len(key_dims) > 0:
         key_idx = np.array(key_dims, dtype=np.int64)
         key_idx = key_idx[(key_idx >= 0) & (key_idx < z_space.shape[1])]
@@ -174,30 +175,34 @@ def save_key_space_tsne(
             print("key_space_warning=invalid_fixed_dims_fallback_to_top1")
         key_mode = "fixed_dims"
     else:
-        key_idx = np.where(anchor_g >= weight_threshold)[0]
-        if key_idx.size == 0:
-            key_idx = np.array([int(np.argmax(anchor_g))], dtype=np.int64)
-            print("key_space_warning=no_dim_passed_threshold_fallback_to_top1")
-        key_mode = "anchor_threshold"
+        k = max(1, min(int(key_topk), z_space.shape[1]))
+        key_idx = np.argsort(anchor_g)[-k:][::-1].astype(np.int64)
+        key_mode = "anchor_topk"
 
     key_space = z_space[:, key_idx]
-    anchor_g_sim = g_space_for_sim[anchor_idx]
-    d = np.linalg.norm(g_space_for_sim - anchor_g_sim[None, :], axis=1)
-    sim_mask = d <= sim_threshold
+    c = cosine_similarity_to_anchor(g_space_for_sim, anchor_idx)
+    sim_mask = c >= sim_cos_threshold
+    effective_threshold = sim_cos_threshold
+    requested_min = max(1, min(int(min_sim_count), c.shape[0]))
+    if int(sim_mask.sum()) < requested_min:
+        kth = float(np.partition(c, c.shape[0] - requested_min)[c.shape[0] - requested_min])
+        effective_threshold = min(sim_cos_threshold, kth)
+        sim_mask = c >= effective_threshold
     save_space_tsne_with_sim(
         space=key_space,
         sim_mask=sim_mask,
         anchor_idx=anchor_idx,
-        pred_label=pred_label,
+        label=pred_label,
         out_path=out_path,
         title=(
-            f"key-space t-SNE (anchor g >= {weight_threshold:.4f}, "
-            f"SIM@{sim_threshold:.4f})"
+            f"key-space t-SNE (anchor top-{int(key_idx.size)} dims, "
+            f"SIM cos>={effective_threshold:.4f})"
         ),
     )
 
     print(f"key_space_mode={key_mode}")
-    print(f"key_space_threshold={weight_threshold:.6f}")
+    print(f"key_space_topk={int(key_idx.size)}")
+    print(f"key_space_sim_cos_threshold_effective={effective_threshold:.6f}")
     print(f"key_space_anchor_idx={anchor_idx}")
     print(f"key_space_dims={key_idx.tolist()}")
     print(f"key_space_dim={int(key_idx.size)}")
@@ -207,7 +212,7 @@ def save_space_tsne_with_sim(
     space: np.ndarray,
     sim_mask: np.ndarray,
     anchor_idx: int,
-    pred_label: np.ndarray,
+    label: np.ndarray,
     out_path: str,
     title: str,
 ) -> None:
@@ -217,8 +222,8 @@ def save_space_tsne_with_sim(
     plt.figure(figsize=(8, 6))
     non = ~sim_mask
     cmap = np.array(["#1f77b4", "#d62728"])
-    plt.scatter(emb[non, 0], emb[non, 1], c=cmap[pred_label[non]], s=7, alpha=0.10, label="non-SIM")
-    plt.scatter(emb[sim_mask, 0], emb[sim_mask, 1], c=cmap[pred_label[sim_mask]], s=11, alpha=0.90, label="SIM")
+    plt.scatter(emb[non, 0], emb[non, 1], c=cmap[label[non]], s=7, alpha=0.10, label="non-SIM")
+    plt.scatter(emb[sim_mask, 0], emb[sim_mask, 1], c=cmap[label[sim_mask]], s=11, alpha=0.90, label="SIM")
     plt.scatter(emb[anchor_idx, 0], emb[anchor_idx, 1], c="#facc15", s=110, marker="*", label="anchor")
     plt.title(title)
     plt.xlabel("t-SNE 1")
@@ -230,40 +235,114 @@ def save_space_tsne_with_sim(
     print(f"saved_tsne={out_path}")
 
 
+def save_space_tsne_with_sim_digit10(
+    space: np.ndarray,
+    sim_mask: np.ndarray,
+    anchor_idx: int,
+    digit_label: np.ndarray,
+    out_path: str,
+    title: str,
+) -> None:
+    tsne = TSNE(n_components=2, random_state=42, init="pca", learning_rate="auto", perplexity=30)
+    emb = tsne.fit_transform(space)
+
+    plt.figure(figsize=(8, 6))
+    non = ~sim_mask
+    cmap = plt.get_cmap("tab10")
+    c_non = cmap(np.mod(digit_label[non], 10))
+    c_sim = cmap(np.mod(digit_label[sim_mask], 10))
+    plt.scatter(emb[non, 0], emb[non, 1], c=c_non, s=7, alpha=0.10)
+    plt.scatter(emb[sim_mask, 0], emb[sim_mask, 1], c=c_sim, s=11, alpha=0.90)
+    plt.scatter(emb[anchor_idx, 0], emb[anchor_idx, 1], c="#facc15", s=110, marker="*")
+    plt.title(title)
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+
+    status_handles = [
+        Line2D([], [], marker="o", linestyle="", color="#666666", alpha=0.2, markersize=6, label="non-SIM"),
+        Line2D([], [], marker="o", linestyle="", color="#111111", alpha=0.9, markersize=6, label="SIM"),
+        Line2D([], [], marker="*", linestyle="", color="#facc15", markersize=12, label="anchor"),
+    ]
+    leg1 = plt.legend(handles=status_handles, loc="upper right", title="Group")
+    plt.gca().add_artist(leg1)
+
+    digit_handles = [
+        Line2D([], [], marker="o", linestyle="", color=cmap(i), markersize=6, label=str(i))
+        for i in range(10)
+    ]
+    plt.legend(handles=digit_handles, loc="lower right", title="Digit", ncol=2, fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    print(f"saved_tsne={out_path}")
+
+
 def save_gz_tsne_with_gspace_sim(
     g_space: np.ndarray,
     g_space_for_sim: np.ndarray,
     z_space: np.ndarray,
     pred_label: np.ndarray,
+    digit_label: np.ndarray,
     anchor_idx: int,
     g_out: str,
     z_out: str,
-    threshold: float,
+    g_out_digit10: str,
+    z_out_digit10: str,
+    cos_threshold: float,
+    min_sim_count: int,
 ) -> None:
-    anchor_g_sim = g_space_for_sim[anchor_idx]
-    d = np.linalg.norm(g_space_for_sim - anchor_g_sim[None, :], axis=1)
-    sim_mask = d <= threshold
+    c = cosine_similarity_to_anchor(g_space_for_sim, anchor_idx)
+    sim_mask = c >= cos_threshold
+    effective_threshold = cos_threshold
+    adjusted_threshold = False
+
+    requested_min = max(1, min(int(min_sim_count), c.shape[0]))
+    if int(sim_mask.sum()) < requested_min:
+        kth = float(np.partition(c, c.shape[0] - requested_min)[c.shape[0] - requested_min])
+        effective_threshold = min(cos_threshold, kth)
+        sim_mask = c >= effective_threshold
+        adjusted_threshold = True
 
     print(f"sim_anchor_idx={anchor_idx}")
-    print(f"sim_on_normalized_g={int(np.any(np.abs(g_space_for_sim - g_space) > 1e-12))}")
-    print(f"sim_threshold={threshold:.6f}")
+    print(f"sim_on_log_centered_g={int(np.any(np.abs(g_space_for_sim - g_space) > 1e-12))}")
+    print(f"sim_cos_threshold_requested={cos_threshold:.6f}")
+    print(f"sim_cos_threshold_effective={effective_threshold:.6f}")
+    print(f"sim_cos_threshold_adjusted={int(adjusted_threshold)}")
+    print(f"sim_min_count_target={requested_min}")
     print(f"sim_count={int(sim_mask.sum())}")
     print(f"sim_ratio={float(sim_mask.mean()):.6f}")
     save_space_tsne_with_sim(
-        space=g_space,
+        space=g_space_for_sim,
         sim_mask=sim_mask,
         anchor_idx=anchor_idx,
-        pred_label=pred_label,
+        label=pred_label,
         out_path=g_out,
-        title=f"g-space t-SNE (SIM from g-space, threshold={threshold:.4f})",
+        title=f"log-centered g-space t-SNE (SIM from cosine on log-centered g, cos>={effective_threshold:.4f})",
     )
     save_space_tsne_with_sim(
         space=z_space,
         sim_mask=sim_mask,
         anchor_idx=anchor_idx,
-        pred_label=pred_label,
+        label=pred_label,
         out_path=z_out,
-        title=f"z-space t-SNE (SIM from g-space, threshold={threshold:.4f})",
+        title=f"z-space t-SNE (SIM from cosine on log-centered g, cos>={effective_threshold:.4f})",
+    )
+    save_space_tsne_with_sim_digit10(
+        space=g_space_for_sim,
+        sim_mask=sim_mask,
+        anchor_idx=anchor_idx,
+        digit_label=digit_label,
+        out_path=g_out_digit10,
+        title=f"log-centered g-space t-SNE (SIM from cosine, true digit 0-9, cos>={effective_threshold:.4f})",
+    )
+    save_space_tsne_with_sim_digit10(
+        space=z_space,
+        sim_mask=sim_mask,
+        anchor_idx=anchor_idx,
+        digit_label=digit_label,
+        out_path=z_out_digit10,
+        title=f"z-space t-SNE (SIM from cosine, true digit 0-9, cos>={effective_threshold:.4f})",
     )
 
 
@@ -273,19 +352,21 @@ def collect_gz_from_loader(
     loader: DataLoader,
     device: torch.device,
     max_samples: int = 3000,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
     g_list: list[np.ndarray] = []
     z_list: list[np.ndarray] = []
     pred_list: list[np.ndarray] = []
+    digit_list: list[np.ndarray] = []
     collected = 0
 
-    for xb, _ in loader:
+    for xb, y_digit in loader:
         xb = xb.to(device)
         logits, g, z = model.forward_with_spaces(xb)
         g_np = g.detach().cpu().numpy()
         z_np = z.detach().cpu().numpy()
         p_np = logits.argmax(dim=1).detach().cpu().numpy()
+        d_np = y_digit.detach().cpu().numpy()
 
         if collected + g_np.shape[0] > max_samples:
             keep = max_samples - collected
@@ -294,22 +375,41 @@ def collect_gz_from_loader(
             g_np = g_np[:keep]
             z_np = z_np[:keep]
             p_np = p_np[:keep]
+            d_np = d_np[:keep]
 
         g_list.append(g_np)
         z_list.append(z_np)
         pred_list.append(p_np)
+        digit_list.append(d_np)
         collected += g_np.shape[0]
         if collected >= max_samples:
             break
 
-    return np.concatenate(g_list, axis=0), np.concatenate(z_list, axis=0), np.concatenate(pred_list, axis=0)
+    return (
+        np.concatenate(g_list, axis=0),
+        np.concatenate(z_list, axis=0),
+        np.concatenate(pred_list, axis=0),
+        np.concatenate(digit_list, axis=0),
+    )
 
 
-def normalize_g_space_featurewise(g_space: np.ndarray) -> np.ndarray:
-    mu = g_space.mean(axis=0, keepdims=True)
-    sigma = g_space.std(axis=0, keepdims=True)
-    sigma = np.where(sigma < 1e-8, 1.0, sigma)
-    return (g_space - mu) / sigma
+def log_center_g_space(g_space: np.ndarray, eps: float) -> np.ndarray:
+    l = np.log(g_space + eps)
+    return l - l.mean(axis=1, keepdims=True)
+
+
+def l2_normalize_rows(space: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(space, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    return space / norms
+
+
+def cosine_similarity_to_anchor(space: np.ndarray, anchor_idx: int) -> np.ndarray:
+    anchor = space[anchor_idx]
+    anchor_norm = np.linalg.norm(anchor)
+    norms = np.linalg.norm(space, axis=1)
+    denom = np.maximum(norms * max(anchor_norm, 1e-12), 1e-12)
+    return (space @ anchor) / denom
 
 
 def main(args: argparse.Namespace) -> None:
@@ -329,33 +429,35 @@ def main(args: argparse.Namespace) -> None:
         generator=torch.Generator().manual_seed(args.seed),
     )
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-
-    print("[baseline]")
-    base = BaselineDNN(hidden_dims=(args.h1, args.h2, args.h3), n_classes=2)
-    m_base = train_and_eval(base, train_loader, val_loader, test_loader, device, args.epochs, args.lr)
-    print(f"baseline_best_val_acc={m_base['best_val_acc']:.6f}")
-    print(f"baseline_test_acc={m_base['test_acc']:.6f}")
+    pin_memory = device.type == "cuda"
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=pin_memory)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=pin_memory)
+    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=pin_memory)
 
     print("[gated]")
     gate = GatedDNN(hidden_dims=(args.h1, args.h2, args.h3), gate_hidden=args.gate_hidden, n_classes=2)
     m_gate = train_and_eval(gate, train_loader, val_loader, test_loader, device, args.epochs, args.lr)
     print(f"gated_best_val_acc={m_gate['best_val_acc']:.6f}")
     print(f"gated_test_acc={m_gate['test_acc']:.6f}")
-    g_space, z_space, pred_label = collect_gz_from_loader(
+    g_space, z_space, pred_label, true_digit = collect_gz_from_loader(
         m_gate["model"],
         test_loader,
         device,
         max_samples=args.tsne_samples,
     )
-    g_space_for_sim = normalize_g_space_featurewise(g_space) if (not args.no_normalize_g_for_sim) else g_space
+    if not args.no_log_center_g_for_sim:
+        g_space_for_sim = l2_normalize_rows(log_center_g_space(g_space, args.log_eps))
+    else:
+        g_space_for_sim = g_space
     save_space_tsne_by_pred(
         space=g_space_for_sim,
         pred_label=pred_label,
         out_path=args.g_tsne_out,
-        title="g-space t-SNE (normalized-by-feature, color=pred 0/1)" if (not args.no_normalize_g_for_sim) else "g-space t-SNE (raw, color=pred 0/1)",
+        title=(
+            f"g-space t-SNE (log-center, eps={args.log_eps:.1e}, color=pred 0/1)"
+            if (not args.no_log_center_g_for_sim)
+            else "g-space t-SNE (raw, color=pred 0/1)"
+        ),
     )
     save_space_tsne_by_pred(
         space=z_space,
@@ -371,29 +473,40 @@ def main(args: argparse.Namespace) -> None:
         g_space_for_sim=g_space_for_sim,
         z_space=z_space,
         pred_label=pred_label,
+        digit_label=true_digit,
         anchor_idx=anchor_idx,
         g_out=args.g_sim_tsne_out,
         z_out=args.z_sim_tsne_out,
-        threshold=args.sim_threshold,
+        g_out_digit10=args.g_sim_tsne_out_digit10,
+        z_out_digit10=args.z_sim_tsne_out_digit10,
+        cos_threshold=args.sim_threshold,
+        min_sim_count=args.min_sim_count,
     )
     save_key_space_tsne(
-        g_space=g_space,
         g_space_for_sim=g_space_for_sim,
         z_space=z_space,
         pred_label=pred_label,
         anchor_idx=anchor_idx,
-        weight_threshold=args.key_weight_threshold,
-        sim_threshold=args.sim_threshold,
+        key_topk=args.key_topk,
+        sim_cos_threshold=args.sim_threshold,
+        min_sim_count=args.min_sim_count,
         out_path=args.key_space_tsne_out,
         key_dims=parse_key_dims(args.key_dims),
     )
 
-    print("[delta gated - baseline]")
-    print(f"delta_val_acc={m_gate['best_val_acc'] - m_base['best_val_acc']:.6f}")
-    print(f"delta_test_acc={m_gate['test_acc'] - m_base['test_acc']:.6f}")
+    print("[baseline] skipped in exp2")
 
 
 if __name__ == "__main__":
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parents[1]
+    default_data_dir = Path("/workspace/mnist_data")
+    default_key_dims = ""
+    default_tag = "exp2_logc"
+
+    def default_out(name: str) -> str:
+        return str(script_dir / f"{name}_{default_tag}.png")
+
     def parse_key_dims(text: str) -> list[int] | None:
         t = text.strip()
         if not t:
@@ -406,7 +519,7 @@ if __name__ == "__main__":
         return out
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=str, default="/workspace/mnist_data")
+    parser.add_argument("--data-dir", type=str, default=str(default_data_dir))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--epochs", type=int, default=6)
@@ -416,15 +529,31 @@ if __name__ == "__main__":
     parser.add_argument("--h2", type=int, default=256)
     parser.add_argument("--h3", type=int, default=128)
     parser.add_argument("--gate-hidden", type=int, default=256)
-    parser.add_argument("--g-tsne-out", type=str, default="/workspace/mnist_g_space_tsne_pred01.png")
-    parser.add_argument("--z-tsne-out", type=str, default="/workspace/mnist_z_space_tsne_pred01.png")
-    parser.add_argument("--g-sim-tsne-out", type=str, default="/workspace/mnist_g_space_tsne_sim_from_g.png")
-    parser.add_argument("--z-sim-tsne-out", type=str, default="/workspace/mnist_z_space_tsne_sim_from_g.png")
-    parser.add_argument("--key-space-tsne-out", type=str, default="/workspace/mnist_key_space_tsne_pred01.png")
-    parser.add_argument("--key-dims", type=str, default="")
+    parser.add_argument("--g-tsne-out", type=str, default=default_out("mnist_g_space_tsne_pred01"))
+    parser.add_argument("--z-tsne-out", type=str, default=default_out("mnist_z_space_tsne_pred01"))
+    parser.add_argument("--g-sim-tsne-out", type=str, default=default_out("mnist_g_space_tsne_sim_from_g"))
+    parser.add_argument("--z-sim-tsne-out", type=str, default=default_out("mnist_z_space_tsne_sim_from_g"))
+    parser.add_argument("--g-sim-tsne-out-digit10", type=str, default=default_out("mnist_g_space_tsne_sim_from_g_digit10"))
+    parser.add_argument("--z-sim-tsne-out-digit10", type=str, default=default_out("mnist_z_space_tsne_sim_from_g_digit10"))
+    parser.add_argument("--key-space-tsne-out", type=str, default=default_out("mnist_key_space_tsne_top3"))
+    parser.add_argument("--key-dims", type=str, default=default_key_dims)
+    parser.add_argument("--key-topk", type=int, default=3)
     parser.add_argument("--tsne-samples", type=int, default=3000)
-    parser.add_argument("--sim-threshold", type=float, default=0.03)
-    parser.add_argument("--key-weight-threshold", type=float, default=0.01)
-    parser.add_argument("--no-normalize-g-for-sim", action="store_true")
+    parser.add_argument("--sim-threshold", type=float, default=0.998)
+    parser.add_argument("--min-sim-count", type=int, default=30)
+    parser.add_argument("--log-eps", type=float, default=1e-8)
+    parser.add_argument("--no-log-center-g-for-sim", action="store_true")
     args = parser.parse_args()
+
+    for path in (
+        args.g_tsne_out,
+        args.z_tsne_out,
+        args.g_sim_tsne_out,
+        args.z_sim_tsne_out,
+        args.g_sim_tsne_out_digit10,
+        args.z_sim_tsne_out_digit10,
+        args.key_space_tsne_out,
+    ):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+
     main(args)
