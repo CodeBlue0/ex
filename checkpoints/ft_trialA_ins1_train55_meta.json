@@ -1,0 +1,14 @@
+{
+  "checkpoint_path": "/workspace/checkpoints/ft_trialA_ins1_train55.pt",
+  "cohort": "INS_GBN_CD==1",
+  "train_rebalance": "5:5",
+  "val_best_threshold": 0.0,
+  "val_best_acc": 0.9231294841134268,
+  "counts_table": {
+    "true_0": 1123,
+    "true_1": 13508,
+    "pred_0": 0,
+    "pred_1": 14631
+  },
+  "note": "categorical mapping/imputer/scaler were fitted in-session for this run"
+}
