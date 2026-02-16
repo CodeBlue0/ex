@@ -1,0 +1,2 @@
+sample_pos,true_digit_label,pred_label_bin,is_anchor,in_sim_a,in_sim_b,ga_max,ga_top3_sum,ga_entropy,gb_max,gb_top3_sum,gb_entropy
+892,2,0,1,1,0,0.3450842797756195,0.5431021451950073,2.636202096939087,0.3686450123786926,0.5542798638343811,2.405452251434326

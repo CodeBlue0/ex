@@ -6,7 +6,10 @@
 - Device: CUDA
 - Epochs: 6
 - Batch size: 512
-- SIM threshold: 0.20
+- SIM threshold (`--sim-threshold`): `0.85`
+  - 기준: `g-space`에서 anchor 대비 cosine similarity (`cos >= sim-threshold`)
+- Key dimension threshold (`--key-weight-threshold`): `0.01`
+  - 기준: anchor의 `g` 값이 threshold 이상인 차원 선택
 
 ## Key outputs
 - `mnist_g_space_tsne_pred01.png`
@@ -21,7 +24,7 @@
 - gated_test_acc: 0.9788
 - delta_test_acc: -0.0030
 - sim_anchor_idx: 267
-- sim_ratio (@0.20): 0.072333
+- sim_ratio (@0.85): 0.072333
 - fixed key dims: [542, 157]
 
 
